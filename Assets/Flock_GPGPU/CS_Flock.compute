@@ -1,0 +1,135 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel DoFlock
+
+//All data that is not unique to singular boids
+cbuffer CB
+{
+    //Misc
+    float deltaTime;
+    uint boidCount;
+    
+    //Behaviour
+    float3 target;
+    float neighbourRadius;
+    float turnSpeed;
+    float velocity;
+    
+    //Weighting
+    float weightAlignment;
+    float weightCohesion;
+    float weightSeparation;
+    float weightSeek;
+    
+    //Avoidance
+    uint enemyCount;
+    float avoidanceMultiplier;
+};
+
+//A struct containing data for one boid
+struct Boid
+{
+    float3 pos;
+    float3 dir;
+};
+
+//A struct containing data for one enemy
+struct Enemy
+{
+    float3 pos;
+    float radius;
+};
+
+RWStructuredBuffer<Boid> boidBuffer;
+StructuredBuffer<Enemy> enemyBuffer;
+
+[numthreads(1024, 1, 1)]
+void DoFlock(uint3 id : SV_DispatchThreadID)
+{
+    //Get initial data
+    Boid boid = boidBuffer[id.x];
+    
+    //Setup stuff
+    float3 alignment = float3(0.f, 0.f, 0.f);
+    float3 cohesion = float3(0.f, 0.f, 0.f);
+    float3 separation = float3(0.f, 0.f, 0.f);
+    float3 seek = normalize(target - boid.pos);
+    int neighbourCount = 0;
+    
+    //Avoidance
+    float avoidanceWeight = 0.f;
+    float3 avoidanceDir = float3(0.f, 0.f, 0.f);
+    uint inRadiusCount = 0;
+    
+    //Look through all enemies
+    for (uint j = 0; j < enemyCount; ++j)
+    {
+        //Cache
+        float3 enemyPos = enemyBuffer[j].pos;
+        float avoidanceRadius = enemyBuffer[j].radius;
+        
+        //Avoidance stuff
+        const float avoidanceLength = length(boid.pos - enemyPos);
+        if (avoidanceLength < avoidanceRadius)
+        {
+            //Result
+            avoidanceDir += boid.pos - enemyPos;
+            avoidanceWeight += saturate((1.f - avoidanceLength / avoidanceRadius) * avoidanceMultiplier);
+            ++inRadiusCount;
+        }
+    }
+    
+    //If influenced by ANY enemy, then actually normalise dir/saturate weight
+    if (inRadiusCount > 0)
+    {
+        //Normalise results
+        avoidanceDir = normalize(avoidanceDir);
+        avoidanceWeight = saturate(avoidanceWeight);
+    }
+    
+    //Do flock against all other boids
+    for (uint i = 0; i < boidCount; ++i)
+    {
+        if(i != id.x) //Cannot do flock against ourselves
+        {
+            const Boid otherBoid = boidBuffer[i]; //Cache
+            
+            const float distance = length(float3(otherBoid.pos - boid.pos));
+            if (distance < neighbourRadius) //If close enough to affect
+            {
+                alignment += otherBoid.dir; //Alignment -> Align self to directions of other boids
+                cohesion += otherBoid.pos; //Cohesion -> Go towards center of mass
+                separation += (boid.pos - otherBoid.pos) * saturate(1.f - distance / neighbourRadius); //Separation -> scale according to distance to other boid
+                
+                //Valid neighbour, so increase count
+                ++neighbourCount;
+            }
+        }
+    }
+    
+    //Don't ever divide by 0
+    if(neighbourCount != 0)
+    {
+        alignment /= neighbourCount; //No normalise because it should already be by default
+        
+        cohesion /= (neighbourCount);
+        cohesion = cohesion - boid.pos;
+        cohesion = normalize(cohesion);
+        
+        //separation /= neighbourCount;
+    }
+    
+    //Reweight according to total weight
+    float totalWeight = weightAlignment + weightCohesion + weightSeparation + weightSeek;
+    weightAlignment /= totalWeight;
+    weightCohesion /= totalWeight;
+    weightSeparation /= totalWeight;
+    weightSeek /= totalWeight;
+    
+    //Result
+    float3 expectedDir = normalize(alignment * weightAlignment + cohesion * weightCohesion + separation * weightSeparation + seek * weightSeek);
+    boid.dir = lerp(boid.dir, lerp(expectedDir, avoidanceDir, avoidanceWeight), deltaTime * turnSpeed);
+    boid.pos += boid.dir * velocity * deltaTime;
+    
+    //Set back
+    boidBuffer[id.x] = boid;
+}
